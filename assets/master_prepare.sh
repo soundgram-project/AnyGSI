@@ -1,14 +1,15 @@
 #!/system/bin/sh
-STAGE="/data/local/tmp/lineage_stage"
+STAGE="/data/lineage"
+[ -d "$STAGE" ] || mkdir -p "$STAGE" 2>/dev/null || STAGE="/data/local/tmp/lineage_stage"
+if [ "$STAGE" = "/data/lineage" ] && [ ! -e "$STAGE/system.raw" ] && [ -e "/data/local/tmp/lineage_stage/system.raw" ]; then
+    ln -sf /data/local/tmp/lineage_stage/system.raw "$STAGE/system.raw" 2>/dev/null || true
+fi
 ROOTFS="$STAGE/rootfs"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 
-echo "=== 1. Ensuring Watchdog Feeder is Active ==="
-if ! ps -ef | grep -v grep | grep -q "/dev/watchdog"; then
-    echo "Starting watchdog feeder..."
-    nohup $BB sh -c "while true; do echo -n 1 > /dev/watchdog 2>/dev/null; sleep 2; done" </dev/null >/dev/null 2>&1 &
-fi
+# Hardware watchdog feeder removed: touching /dev/watchdog without proper ioctl
+# causes Qualcomm kernel watchdog to trigger hard reset after 45 seconds.
 
 echo "=== 2. Creating Loop Device Nodes ==="
 for i in $(seq 50 150); do
@@ -39,11 +40,15 @@ if ! mount | grep -q "$ROOTFS "; then
     LOOP=$($BB losetup -f)
     $BB losetup "$LOOP" "$STAGE/system.raw"
     echo "Using LOOP: $LOOP"
-    $BB mount -t ext4 -o ro "$LOOP" "$ROOTFS"
+    if ! $BB mount -t ext4 -o ro "$LOOP" "$ROOTFS" 2>/dev/null; then
+        echo "ext4 mount failed, trying erofs / auto..."
+        $BB mount -t erofs -o ro "$LOOP" "$ROOTFS" 2>/dev/null || $BB mount -o ro "$LOOP" "$ROOTFS"
+    fi
 fi
 
 mkdir -p "$ROOTFS/postinstall" "$ROOTFS/dev" "$ROOTFS/proc" "$ROOTFS/sys" \
     "$ROOTFS/linkerconfig" "$ROOTFS/vendor" "$ROOTFS/odm" "$ROOTFS/vendor_dlkm" \
+    "$ROOTFS/metadata" "$ROOTFS/config" \
     "$ROOTFS/mnt" "$ROOTFS/storage" "$ROOTFS/apex" "$ROOTFS/data"
 
 echo "=== 4. Setting up Core System Bind Mounts ==="
@@ -64,51 +69,119 @@ fi
 
 mount | grep -q "$ROOTFS/linkerconfig " || $BB mount --rbind /linkerconfig "$ROOTFS/linkerconfig"
 mount | grep -q "$ROOTFS/vendor " || $BB mount --bind /vendor "$ROOTFS/vendor"
+# Ensure /vendor/etc/aconfig exists for aconfigd-system.
+# Samsung vendor partition lacks /vendor/etc/aconfig, causing aconfigd-system to abort.
+if [ ! -d "$ROOTFS/vendor/etc/aconfig" ]; then
+    mkdir -p "$STAGE/vendor_etc_upper" "$STAGE/vendor_etc_work"
+    if ! $BB mount -t overlay overlay -o lowerdir=/vendor/etc,upperdir="$STAGE/vendor_etc_upper",workdir="$STAGE/vendor_etc_work" "$ROOTFS/vendor/etc" 2>/dev/null; then
+        echo "overlayfs failed on /vendor/etc, using bind-mount tmpfs fallback..."
+        $BB mount -t tmpfs tmpfs "$ROOTFS/vendor/etc"
+        for item in /vendor/etc/*; do
+            [ -e "$item" ] || continue
+            base=$(basename "$item")
+            if [ -d "$item" ]; then
+                mkdir -p "$ROOTFS/vendor/etc/$base"
+                $BB mount --bind "$item" "$ROOTFS/vendor/etc/$base" 2>/dev/null || true
+            else
+                touch "$ROOTFS/vendor/etc/$base"
+                $BB mount --bind "$item" "$ROOTFS/vendor/etc/$base" 2>/dev/null || true
+            fi
+        done
+    fi
+    mkdir -p "$ROOTFS/vendor/etc/aconfig"
+    cp -a "$ROOTFS/system/product/etc/aconfig"/* "$ROOTFS/vendor/etc/aconfig/" 2>/dev/null || true
+    echo "Vendor aconfig files staged in $ROOTFS/vendor/etc/aconfig"
+fi
+# Ensure critical hardware features like WiFi Direct are always available to PMS
+mkdir -p "$ROOTFS/system/etc/permissions"
+if [ -f /vendor/etc/permissions/android.hardware.wifi.direct.xml ]; then
+    cp -f /vendor/etc/permissions/android.hardware.wifi.direct.xml "$ROOTFS/system/etc/permissions/android.hardware.wifi.direct.xml" 2>/dev/null || true
+    chmod 644 "$ROOTFS/system/etc/permissions/android.hardware.wifi.direct.xml" 2>/dev/null || true
+fi
+# Bypass Zygote preload class crashes (e.g. SystemServiceRegistry NoClassDefFoundError)
+if [ -f "$ROOTFS/system/etc/preloaded-classes" ]; then
+    mkdir -p "$STAGE/etc"
+    echo "# Cleared preloaded-classes for guest GSI" > "$STAGE/etc/preloaded-classes"
+    $BB mount --bind "$STAGE/etc/preloaded-classes" "$ROOTFS/system/etc/preloaded-classes"
+    echo "Sanitized preloaded-classes -> $ROOTFS/system/etc/preloaded-classes"
+fi
 mount | grep -q "$ROOTFS/odm " || $BB mount --bind /odm "$ROOTFS/odm"
 mount | grep -q "$ROOTFS/vendor_dlkm " || $BB mount --bind /vendor_dlkm "$ROOTFS/vendor_dlkm"
-# apexd is a HOST daemon: it reports the Samsung apex set (/system/apex,
-# /system_ext/apex, /vendor/apex) to the container system_server, which then
-# tries to parse those exact paths inside this namespace. Keep the apex
-# directories identical to what host apexd sees (an empty tmpfs or the GSI's
-# own .capex layout makes PMS abort with "Unable to parse" at boot).
-if [ -d /system_ext/apex ]; then
-    mkdir -p "$ROOTFS/system_ext/apex"
-    mount | grep -q "$ROOTFS/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system_ext/apex"
+if [ -d /metadata ]; then
+    mkdir -p "$ROOTFS/metadata"
+    mount | grep -q "$ROOTFS/metadata " || $BB mount --rbind /metadata "$ROOTFS/metadata"
+    echo "Bound /metadata -> $ROOTFS/metadata"
+fi
+if [ -d /odm_dlkm ]; then
+    mkdir -p "$ROOTFS/odm_dlkm"
+    mount | grep -q "$ROOTFS/odm_dlkm " || $BB mount --bind /odm_dlkm "$ROOTFS/odm_dlkm"
+fi
+if [ -d /system_dlkm ]; then
+    mkdir -p "$ROOTFS/system_dlkm"
+    mount | grep -q "$ROOTFS/system_dlkm " || $BB mount --bind /system_dlkm "$ROOTFS/system_dlkm"
+fi
+if [ -d /config ]; then
+    mkdir -p "$ROOTFS/config"
+    mount | grep -q "$ROOTFS/config " || $BB mount --rbind /config "$ROOTFS/config"
 fi
 mount | grep -q "$ROOTFS/mnt " || $BB mount --rbind /mnt "$ROOTFS/mnt"
-if [ -f "$STAGE/services_patched.jar" ]; then
-    $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
-    $BB mount --bind "$STAGE/services_patched.jar" "$ROOTFS/system/framework/services.jar"
-    echo "Bound services_patched.jar -> $ROOTFS/system/framework/services.jar"
-fi
-if [ -f "$STAGE/framework_patched.jar" ]; then
-    $BB umount -l "$ROOTFS/system/framework/framework.jar" 2>/dev/null || true
-    $BB mount --bind "$STAGE/framework_patched.jar" "$ROOTFS/system/framework/framework.jar"
-    echo "Bound framework_patched.jar -> $ROOTFS/system/framework/framework.jar"
-fi
-if [ -f "$STAGE/libaudio_aidl_conversion_common_cpp_patched.so" ]; then
-    $BB umount -l "$ROOTFS/system/lib64/libaudio_aidl_conversion_common_cpp.so" 2>/dev/null || true
-    $BB mount --bind "$STAGE/libaudio_aidl_conversion_common_cpp_patched.so" "$ROOTFS/system/lib64/libaudio_aidl_conversion_common_cpp.so"
-    echo "Bound libaudio_aidl_conversion_common_cpp_patched.so"
-fi
-if [ -f "$STAGE/libaudioclient_aidl_conversion_patched.so" ]; then
-    $BB umount -l "$ROOTFS/system/lib64/libaudioclient_aidl_conversion.so" 2>/dev/null || true
-    $BB mount --bind "$STAGE/libaudioclient_aidl_conversion_patched.so" "$ROOTFS/system/lib64/libaudioclient_aidl_conversion.so"
-    echo "Bound libaudioclient_aidl_conversion_patched.so"
-fi
-if [ -f "$STAGE/framework-res_patched.apk" ]; then
-    $BB umount -l "$ROOTFS/system/framework/framework-res.apk" 2>/dev/null || true
-    $BB mount --bind "$STAGE/framework-res_patched.apk" "$ROOTFS/system/framework/framework-res.apk"
-    echo "Bound framework-res_patched.apk -> $ROOTFS/system/framework/framework-res.apk"
-fi
+GUEST_SDK=""
+for bp in "$ROOTFS/system/build.prop" "$ROOTFS/system/etc/build.prop" "$ROOTFS/build.prop" "$ROOTFS/etc/build.prop"; do
+    if [ -f "$bp" ]; then
+        GUEST_SDK=$(grep -m1 '^ro.build.version.sdk=' "$bp" 2>/dev/null | cut -d= -f2 | tr -d '\r')
+        [ -n "$GUEST_SDK" ] && break
+    fi
+done
+GUEST_FLAVOR=$(grep -m1 '^ro.lineage.build.version=' "$ROOTFS/system/build.prop" 2>/dev/null | cut -d= -f2 | tr -d '\r')
+[ -n "$GUEST_FLAVOR" ] || GUEST_FLAVOR=$(grep -m1 '^ro.lineage.build.version=' "$ROOTFS/build.prop" 2>/dev/null | cut -d= -f2 | tr -d '\r')
+echo "Detected Guest SDK: ${GUEST_SDK:-unknown}, Lineage flavor: ${GUEST_FLAVOR:-custom}"
 
-if [ -f "$STAGE/PermissionController_patched.apk" ]; then
-    chmod 644 "$STAGE/PermissionController_patched.apk"
-    PERM_APK=$(find "$ROOTFS/apex/com.android.permission" -name "PermissionController.apk" 2>/dev/null | head -n 1)
-    if [ -n "$PERM_APK" ]; then
-        $BB umount -l "$PERM_APK" 2>/dev/null || true
-        $BB mount --bind "$STAGE/PermissionController_patched.apk" "$PERM_APK"
-        echo "Bound PermissionController_patched.apk -> $PERM_APK"
+if [ ! -f "$STAGE/.custom_gsi" ] && [ "${GUEST_SDK:-0}" -eq 36 ] && [ "$GUEST_FLAVOR" = "23.2" ]; then
+    echo "LineageOS 23.2 (Android 16) detected: applying binary compatibility patches..."
+    if [ -f "$STAGE/services_patched.jar" ]; then
+        $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
+        $BB mount --bind "$STAGE/services_patched.jar" "$ROOTFS/system/framework/services.jar"
+        echo "Bound services_patched.jar -> $ROOTFS/system/framework/services.jar"
+    fi
+    if [ -f "$STAGE/libaudio_aidl_conversion_common_cpp_patched.so" ]; then
+        $BB umount -l "$ROOTFS/system/lib64/libaudio_aidl_conversion_common_cpp.so" 2>/dev/null || true
+        $BB mount --bind "$STAGE/libaudio_aidl_conversion_common_cpp_patched.so" "$ROOTFS/system/lib64/libaudio_aidl_conversion_common_cpp.so"
+        echo "Bound libaudio_aidl_conversion_common_cpp_patched.so"
+    fi
+    if [ -f "$STAGE/libaudioclient_aidl_conversion_patched.so" ]; then
+        $BB umount -l "$ROOTFS/system/lib64/libaudioclient_aidl_conversion.so" 2>/dev/null || true
+        $BB mount --bind "$STAGE/libaudioclient_aidl_conversion_patched.so" "$ROOTFS/system/lib64/libaudioclient_aidl_conversion.so"
+        echo "Bound libaudioclient_aidl_conversion_patched.so"
+    fi
+    if [ -f "$STAGE/framework-res_patched.apk" ]; then
+        $BB umount -l "$ROOTFS/system/framework/framework-res.apk" 2>/dev/null || true
+        $BB mount --bind "$STAGE/framework-res_patched.apk" "$ROOTFS/system/framework/framework-res.apk"
+        echo "Bound framework-res_patched.apk -> $ROOTFS/system/framework/framework-res.apk"
+    fi
+    if [ -f "$STAGE/PermissionController_patched.apk" ]; then
+        chmod 644 "$STAGE/PermissionController_patched.apk"
+        PERM_APK=$(find "$ROOTFS/apex/com.android.permission" -name "PermissionController.apk" 2>/dev/null | head -n 1)
+        if [ -n "$PERM_APK" ]; then
+            $BB umount -l "$PERM_APK" 2>/dev/null || true
+            $BB mount --bind "$STAGE/PermissionController_patched.apk" "$PERM_APK"
+            echo "Bound PermissionController_patched.apk -> $PERM_APK"
+        fi
+    fi
+else
+    echo "Android 17 / Custom GSI active: using native guest framework jars & libraries (no A16 override)"
+    if [ -f "$STAGE/services_android17_patched.jar" ]; then
+        $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
+        $BB mount --bind "$STAGE/services_android17_patched.jar" "$ROOTFS/system/framework/services.jar"
+        echo "Bound services_android17_patched.jar -> $ROOTFS/system/framework/services.jar"
+    elif [ -f "$STAGE/services_patched.jar" ] && [ "${GUEST_SDK:-0}" -eq 37 ]; then
+        $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
+        $BB mount --bind "$STAGE/services_patched.jar" "$ROOTFS/system/framework/services.jar"
+        echo "Bound services_patched.jar -> $ROOTFS/system/framework/services.jar"
+    fi
+    if [ -f "$STAGE/framework_patched.jar" ]; then
+        $BB umount -l "$ROOTFS/system/framework/framework.jar" 2>/dev/null || true
+        $BB mount --bind "$STAGE/framework_patched.jar" "$ROOTFS/system/framework/framework.jar"
+        echo "Bound framework_patched.jar (Android 17 XR fix) -> $ROOTFS/system/framework/framework.jar"
     fi
 fi
 
@@ -129,12 +202,32 @@ mkdir -p "$STAGE/data/adb" "$STAGE/data/apex" "$STAGE/data/dalvik-cache/arm64"
 # the whole boot.
 GSET="$STAGE/data/system/users/0/settings_global.xml"
 if [ -f "$GSET" ]; then
-    if grep -q 'id="adb_enabled"' "$GSET" 2>/dev/null; then
-        sed -i 's/id="adb_enabled"\([^>]*\)value="[^"]*"/id="adb_enabled"\1value="1"/' "$GSET" 2>/dev/null
+    MAGIC=$(head -c 3 "$GSET" 2>/dev/null)
+    if [ "$MAGIC" = "ABX" ]; then
+        echo "Guest settings_global.xml is compiled ABX, keeping untouched."
+        cp -f "$GSET" "$GSET.fallback" 2>/dev/null || true
     else
-        sed -i 's#</settings>#    <setting id="adb_enabled" name="adb_enabled" value="1" package="android" />\n</settings>#' "$GSET" 2>/dev/null
+        if grep -q 'name="adb_enabled"' "$GSET" 2>/dev/null; then
+            sed -i 's/name="adb_enabled"\([^>]*\)value="[^"]*"/name="adb_enabled"\1value="1"/' "$GSET" 2>/dev/null
+        else
+            sed -i 's#</settings>#    <setting id="1000" name="adb_enabled" value="1" package="android" defaultValue="1" defaultSysSet="true" />\n</settings>#' "$GSET" 2>/dev/null
+        fi
+        sed -i 's/id="adb_enabled"/id="1000"/' "$GSET" 2>/dev/null
+        sed -i 's/version="-1"/version="180"/' "$GSET" 2>/dev/null
+        cp -f "$GSET" "$GSET.fallback" 2>/dev/null || true
+        echo "Pre-seeded adb_enabled=1 in guest settings_global.xml"
     fi
-    echo "Pre-seeded adb_enabled=1 in guest settings_global.xml"
+else
+    mkdir -p "$(dirname "$GSET")"
+    cat << 'EOF_GSET' > "$GSET"
+<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<settings version="180">
+    <setting id="1000" name="adb_enabled" value="1" package="android" defaultValue="1" defaultSysSet="true" />
+</settings>
+EOF_GSET
+    cp -f "$GSET" "$GSET.fallback" 2>/dev/null || true
+    chmod 600 "$GSET" "$GSET.fallback" 2>/dev/null || true
+    echo "Created initial guest settings_global.xml with adb_enabled=1"
 fi
 
 if [ -f /data/misc/adb/adb_keys ]; then
@@ -164,6 +257,7 @@ for pkg in com.android.providers.settings \
            com.android.providers.contacts \
            com.android.providers.calendar \
            org.lineageos.lineagesettings \
+           com.wewaffles.anygsi \
            com.wewaffles.onelineage; do
     mkdir -p "$STAGE/data/user_de/0/$pkg/databases" \
              "$STAGE/data/user_de/0/$pkg/shared_prefs" \
@@ -241,22 +335,13 @@ for d in "$STAGE/data/misc/profiles/cur" "$STAGE/data/misc/profiles/ref" \
     [ -d "$d" ] && $BB chown system:system "$d" 2>/dev/null || true
 done
 
-echo "=== 5d. Bridging host /data app trees into the staged /data ==="
-# installd and artd are HOST daemons (started by Samsung init, they cannot be
-# moved into the container namespace). Left alone they create every app data
-# dir, dalvik-cache entry and dexopt profile in the real /data, which the guest
-# can never see - so every app process the guest zygote forks dies with:
-#   Failed to mount /data_mirror/data_de/null/0/<pkg> to /data/user_de/0/<pkg>:
-#   No such file or directory
-# ("Failed to attach" / "start timeout" in ActivityManager.) Bind the staged
-# equivalents over those host paths for the duration of the session, so those
-# daemons write into the guest's data. One UI is not running meanwhile and
-# return_to_oneui.sh removes the binds again.
+echo "=== 5d. Preparing isolated /data inside staged environment ==="
+# Host /data directories (/data/app, /data/user, etc.) are strictly protected.
+# All GSI data preparations remain strictly within $STAGE/data without shadowing host paths.
 for d in app app-staging user user_de dalvik-cache misc/profiles; do
     mkdir -p "$STAGE/data/$d" 2>/dev/null || true
-    if [ -d "/data/$d" ] && ! mount | grep -q " /data/$d "; then
-        $BB mount --bind "$STAGE/data/$d" "/data/$d" 2>/dev/null && echo "Bridged /data/$d -> $STAGE/data/$d"
-    fi
+    $BB chown system:system "$STAGE/data/$d" 2>/dev/null || true
+    $BB chmod 0771 "$STAGE/data/$d" 2>/dev/null || true
 done
 
 mount | grep -q "$ROOTFS/data " || $BB mount --bind "$STAGE/data" "$ROOTFS/data"
@@ -266,14 +351,15 @@ mkdir -p "$ROOTFS/data/media"
 mount | grep -q "$ROOTFS/data/media " || $BB mount --bind /data/media "$ROOTFS/data/media" 2>/dev/null || true
 
 echo "=== 5e. Writing per-package data-dir helper ==="
-# Apps installed before the /data bridge existed have no CE/DE data dirs in the
-# guest tree, and the guest zygote refuses to fork them:
-#   Failed to mount /data_mirror/data_de/null/0/<pkg> to /data/user_de/0/<pkg>
-# This helper recreates the dirs for every package the guest knows about, with
-# the uid PMS reports. switch_to_lineage.sh runs it once the container is up.
+# Recreates CE/DE data dirs for guest installed packages inside container.
+# Guarded by /gsi_mode.flag to ensure it NEVER executes against host data.
 mkdir -p "$STAGE/data/local/tmp" 2>/dev/null || true
 cat > "$STAGE/data/local/tmp/fix_app_dirs.sh" <<'FIXAPPDIRS'
 #!/system/bin/sh
+if [ ! -f /gsi_mode.flag ]; then
+    echo "[fix_app_dirs] Refusing to run outside isolated GSI container!"
+    exit 0
+fi
 # Create missing CE/DE data dirs (and dexopt profile dirs) for every installed
 # package, using the uid PMS reports. Idempotent.
 created=0
@@ -403,6 +489,9 @@ chmod 755 "$STAGE/data/local/tmp/fix_app_dirs.sh" 2>/dev/null || true
 # Create the scaffolding installd would; /data_mirror is a bind of these trees.
 cat > "$STAGE/data/local/tmp/ensure_app_storage.sh" <<'ENSUREAPP'
 #!/system/bin/sh
+if [ ! -f /gsi_mode.flag ]; then
+    exit 0
+fi
 created=0
 [ -f /data/system/packages.list ] || exit 0
 realigned=0
@@ -538,6 +627,7 @@ APPLOOP
 chmod 755 "$STAGE/data/local/tmp/app_storage_loop.sh" 2>/dev/null || true
 
 echo "=== 6. Setting up /system/xbin/su (KernelSU Bridge) ==="
+mkdir -p "$ROOTFS/system/xbin"
 if ! mount | grep -q "$ROOTFS/system/xbin "; then
     $BB mount -t tmpfs tmpfs "$ROOTFS/system/xbin"
     SU_SRC="/data/adb/ksud"
@@ -559,10 +649,24 @@ $BB mount -t tmpfs tmpfs "$ROOTFS/apex"
 # are bound into this rootfs (see the /system_ext/apex and /system/apex binds):
 # every path in this list must resolve after the pivot.
 if [ -f "$STAGE/clean_apex_info_list.xml" ]; then
-    cp "$STAGE/clean_apex_info_list.xml" "$ROOTFS/apex/apex-info-list.xml"
+    echo "=== Sanitizing apex-info-list.xml against rootfs ==="
+    echo "<?xml version='1.0' encoding='utf-8'?>" > "$ROOTFS/apex/apex-info-list.xml"
+    echo "<apex-info-list>" >> "$ROOTFS/apex/apex-info-list.xml"
+    while IFS= read -r line; do
+        if echo "$line" | grep -q '<apex-info '; then
+            mod_path=$(echo "$line" | sed -n 's/.*modulePath="\([^"]*\)".*/\1/p')
+            if [ -n "$mod_path" ] && [ -f "$ROOTFS$mod_path" ]; then
+                echo "$line" >> "$ROOTFS/apex/apex-info-list.xml"
+            else
+                echo "Skipping non-existent apex: $mod_path"
+            fi
+        fi
+    done < "$STAGE/clean_apex_info_list.xml"
+    echo "</apex-info-list>" >> "$ROOTFS/apex/apex-info-list.xml"
 else
     cp -a /apex/apex-info-list.xml "$ROOTFS/apex/" 2>/dev/null || true
 fi
+sed -i '/samsung/d; /sec\./d; /lifeguard/d' "$ROOTFS/apex/apex-info-list.xml" 2>/dev/null || true
 chmod 644 "$ROOTFS/apex/apex-info-list.xml" 2>/dev/null || true
 
 echo "=== 8. Direct Mounting Extracted APEX Payloads ==="
@@ -597,44 +701,33 @@ mount_payload() {
     $BB umount -l "$DEST" 2>/dev/null || true
     LOOP=$($BB losetup -f)
     $BB losetup "$LOOP" "$IMG"
-    $BB mount -t ext4 -o ro "$LOOP" "$DEST"
+    $BB mount -t ext4 -o ro "$LOOP" "$DEST" 2>/dev/null || $BB mount -t erofs -o ro "$LOOP" "$DEST" 2>/dev/null || $BB mount -o ro "$LOOP" "$DEST" 2>/dev/null || true
     echo "Direct mounted $NAME on $LOOP -> $DEST"
     for vdir in "$ROOTFS/apex/${TARGET}"@*; do
         if [ -d "$vdir" ]; then
-       $BB umount -l "$vdir" 2>/dev/null || true
-       $BB mount -t ext4 -o ro "$LOOP" "$vdir"
-       echo "Direct mounted $NAME on $LOOP -> $vdir"
+            $BB umount -l "$vdir" 2>/dev/null || true
+            $BB mount -t ext4 -o ro "$LOOP" "$vdir" 2>/dev/null || $BB mount -t erofs -o ro "$LOOP" "$vdir" 2>/dev/null || $BB mount -o ro "$LOOP" "$vdir" 2>/dev/null || true
+            echo "Direct mounted $NAME on $LOOP -> $vdir"
         fi
     done
 }
 
-mount_payload "art" "com.android.art"
-mount_payload "i18n" "com.android.i18n"
-mount_payload "runtime" "com.android.runtime"
-mount_payload "sdkext" "com.android.sdkext"
-mount_payload "nfcservices" "com.android.nfcservices"
-mount_payload "tethering" "com.android.tethering"
-mount_payload "crashrecovery" "com.android.crashrecovery"
-mount_payload "cellbroadcast" "com.android.cellbroadcast"
-mount_payload "extservices" "com.android.extservices"
-mount_payload "permission" "com.android.permission"
-mount_payload "wifi" "com.android.wifi"
-mount_payload "appsearch" "com.android.appsearch"
-mount_payload "mediaprovider" "com.android.mediaprovider"
-mount_payload "adservices" "com.android.adservices"
-mount_payload "rkpd" "com.android.rkpd"
-mount_payload "healthfitness" "com.android.healthfitness"
-mount_payload "ondevicepersonalization" "com.android.ondevicepersonalization"
-mount_payload "configinfrastructure" "com.android.configinfrastructure"
-mount_payload "bt" "com.android.bt"
+for a in "$ROOTFS/system/apex"/*.apex "$ROOTFS/system/apex"/*.capex "$ROOTFS/system_ext/apex"/*.apex; do
+    [ -f "$a" ] || continue
+    base=$(basename "$a" | sed -e 's/\.apex$//' -e 's/\.capex$//')
+    short_name=$(echo "$base" | sed -e 's/^com\.android\.//' -e 's/^com\.google\.android\.//')
+    mount_payload "$short_name" "$base"
+done
 
-# Payload extractions above used the GSI's own /system/apex files. Now that the
-# images are cached, present the HOST's /system/apex to the container so the
-# preinstalled paths reported by host apexd all resolve (see the note above
-# about /system_ext/apex).
+# Present host /system_ext/apex and /system/apex to the container so that
+# the preinstalled paths reported by host apexd all resolve in PMS.
+if [ -d /system_ext/apex ]; then
+    mount | grep -q "$ROOTFS/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system_ext/apex" 2>/dev/null || $BB mount --bind /system_ext/apex "$ROOTFS/system/system_ext/apex" 2>/dev/null || true
+    echo "Bound host /system_ext/apex -> $ROOTFS/system_ext/apex"
+fi
 if [ -d /system/apex ]; then
-    mkdir -p "$ROOTFS/system/apex"
-    mount | grep -q "$ROOTFS/system/apex " || $BB mount --bind /system/apex "$ROOTFS/system/apex"
+    mount | grep -q "$ROOTFS/system/apex " || $BB mount --bind /system/apex "$ROOTFS/system/apex" 2>/dev/null || true
+    echo "Bound host /system/apex -> $ROOTFS/system/apex"
 fi
 
 echo "=== 9. Bind-mounting Remaining Non-Payload APEXes ==="
@@ -663,16 +756,12 @@ done
 #   -> "Permission controller keeps stopping"
 # and Gallery/Phone/Calendar can never be granted anything. Bind it now that
 # /apex/com.android.permission actually exists.
-if [ -f "$STAGE/PermissionController_patched.apk" ]; then
+if [ ! -f "$STAGE/.custom_gsi" ] && [ "${GUEST_SDK:-0}" -eq 36 ] && [ "$GUEST_FLAVOR" = "23.2" ] && [ -f "$STAGE/PermissionController_patched.apk" ]; then
     chmod 644 "$STAGE/PermissionController_patched.apk" 2>/dev/null || true
     for PERM_APK in $(find "$ROOTFS/apex/com.android.permission" -name "PermissionController.apk" 2>/dev/null); do
         $BB umount -l "$PERM_APK" 2>/dev/null || true
         $BB mount --bind "$STAGE/PermissionController_patched.apk" "$PERM_APK" 2>/dev/null && echo "Bound PermissionController_patched.apk (late) -> $PERM_APK"
     done
-else
-    echo "!!! WARNING: PermissionController_patched.apk missing from $STAGE"
-    echo "!!! Samsung's PermissionController will crash every runtime-permission dialog"
-    echo "!!! (android.permission.RANGING not defined by platform)"
 fi
 
 echo "=== ALL MOUNTS PREPARED SUCCESSFULLY ==="

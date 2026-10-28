@@ -2,3 +2,12 @@ build/
 keystore/
 backups_*/
 *.idsig
+*.log
+.idea/
+*.iml
+screen*.png
+screencap*.png
+scratch_feeder
+s.sh
+b.sh
+*.apk

@@ -1,61 +1,110 @@
-# OneLineage
+<div align="center">
 
- **NOTE: OneLineage is just a proof of concept, this repo should provide you with enough to port other roms to bootloader locked devices, the lineageos with this repo is just a demo of this capability, and therefore does not fully work. Have fun!**
+<h1 style="color: #FF2B2B;"><strong>⚠️ ВНИМАНИЕ: Проект находится в стадии активной разработки (Work In Progress) и ещё НЕ ДОРАБОТАН! ⚠️</strong></h1>
+<h3 style="color: #FF4444;"><strong>WARNING: This project is a Work in Progress (WIP) and is NOT YET COMPLETE or stable! Use strictly at your own risk.</strong></h3>
 
-Hot-switch between stock **One UI** and a **LineageOS 23.2 (Android 16) GSI** on a rooted Samsung phone, with no reflashing and no second partition. OneLineage stages the GSI under `/data/local/tmp`, pivots into it as a container with its own zygote and system_server, and can hand the screen back to One UI.
+<br />
 
-> ## Disclaimer
-> **This has been tested on only a handful of devices, and it seems if you want to install it without making modifications, it has to be on Android 16**
-> It may not work on other Samsung models, other One UI versions, or other devices at all. It is experimental, it replaces core parts of a running system, and it can crash, hang or soft-brick your phone, fill `/data`, or break radio/SMS. **Back up everything first. Use at your own risk.**
-> Also, I did use AI a fair bit in this project, it would have taken a LOT longer without it.
+<img src="anygsi_logo.png" alt="AnyGSI Logo" width="180" style="border-radius: 36px; box-shadow: 0 8px 32px rgba(34, 163, 168, 0.4);" />
 
-## Requirements
-- A rooted Samsung phone (the tested one is an S26 Ultra on One UI 8.5)
-- Enough free space on `/data` for the extracted GSI
-- Internet access for the GSI download (LineageOS 23.2 GSI, EXT4, VANILLA or GAPPS builds from SourceForge)
+# AnyGSI
+**Универсальный переключатель пространств пользователя и GSI-контейнеризация для Android**<br />
+*Universal Android Userspace Switcher & On-the-Fly GSI Container Engine*
 
-## What's in here
-| Path | What it is |
+[![Android](https://img.shields.io/badge/Android-14%20|%2015%20|%2016%20|%2017-brightgreen.svg?style=flat-square&logo=android)](#)
+[![Root](https://img.shields.io/badge/Root-KernelSU%20|%20Magisk-orange.svg?style=flat-square)](#)
+[![Architecture](https://img.shields.io/badge/Arch-arm64--v8a-blue.svg?style=flat-square)](#)
+[![Status](https://img.shields.io/badge/Status-Alpha%20WIP-red.svg?style=flat-square)](#)
+
+</div>
+
+---
+
+> [!CAUTION]
+> ### 🔴 ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ / DISCLAIMER
+> **Приложение подменяет ключевые системные службы работающей ОС (`zygote`, `surfaceflinger`, `system_server`).**
+> Данное решение изначально исследовалось и тестировалось на Samsung Galaxy (One UI 8.5 / 9.0, Android 16/17). На других устройствах, прошивках или версиях ядра возможны зависания, краши, циклические перезагрузки (bootloop) или сбои сети/SMS. **Обязательно сделайте полный бэкап устройства перед использованием!**
+
+---
+
+## 📖 О проекте (About AnyGSI)
+
+**AnyGSI** позволяет «на лету» (hot-switch) переключаться между стоковой прошивкой производителя (например, **Samsung One UI**) и произвольным **GSI-образом** (LineageOS, Pixel Experience, AOSP, Android 16 / 17) на rooted-устройствах без перепрошивки разделов, без разметки второго диска и без длительной перезагрузки ядра.
+
+AnyGSI разворачивает окружение GSI в изолированной файловой системе (`/data/lineage/`), изолирует точки монтирования через Linux Mount Namespaces (`unshare -m`), выполняет `pivot_root` и запускает гостевой `zygote` и `system_server` под контролем нативного бинарника `zygote_exec`. При необходимости экран и службы мгновенно возвращаются обратно в One UI.
+
+---
+
+## ⚡ Ключевые возможности
+
+* **Запуск любого GSI (.img):** Поддержка выбора любых ARM64 GSI (Android 15, 16, 17, LineageOS 23+).
+* **Изолированное окружение (`/data/lineage`):** Реальные директории хоста (`/data/app`, `/data/user/0`, `/data/media/0`) защищены от перезаписи UID/GID и порчи SELinux-контекстов гостевой системой.
+* **One UI Protection & Recovery Engine:**
+  * **Backup One UI Layout & QS:** Автоматический и ручной бэкап баз данных рабочего стола (`com.sec.android.app.launcher`), виджетов (`appwidgets.xml`), настроек и плиток шторки Quick Settings (`sysui_qs_tiles`).
+  * **Restore One UI (Storage, Home & QS):** Комплексный скрипт `restore_host.sh` для полного восстановления прав системных каталогов, внутренней памяти (`/data/media/0`), принудительного `restorecon -FR` и мгновенного перезапуска SystemUI и лаунчера без перезагрузки телефона.
+* **Поддержка KernelSU & Magisk:** Динамический поиск root-окружения (`/data/adb/ksud debug su`, `/data/adb/ksu/bin/su`, `/data/user_de/0/df.root/ksud`, `/system/bin/su`, `su`).
+* **Аппаратная адаптация:**
+  * Встроенный `watchdog_feeder` для предотвращения kernel panic от сторожевого таймера.
+  * Тюнинг аудио с ультранизкой задержкой (Low-Latency bypass deep buffer).
+  * BPF-маршрутизация сети (`net_fix.sh`) для передачи трафика между гостевым ConnectivityService и хостовым netd.
+  * Keepalive-супервайзеры для сотовой сети/SMS (`imsd`) и ADB-соединения (`adbd`).
+
+---
+
+## 📁 Структура проекта
+
+| Путь | Назначение |
 | --- | --- |
-| `src/`, `res/`, `AndroidManifest.xml` | The Android app (`com.wewaffles.onelineage`) |
-| `assets/master_prepare.sh` | Stages the rootfs, binds the patched files, fixes labels/ownership |
-| `assets/master_inner.sh` | Runs inside the container, starts the guest zygote |
-| `assets/switch_to_lineage.sh` / `return_to_oneui.sh` | Switch in and back out |
-| `assets/zygote_exec` | Static aarch64 launcher for the guest zygote |
-| `build_apk.sh` | Builds and signs the APK |
+| `src/com/wewaffles/anygsi/` | Исходный код Android-приложения (`MainActivity`, `RootReceiver`) |
+| `res/` | Разметка Material 3, адаптивные иконки и ресурсы AnyGSI |
+| `assets/restore_host.sh` | Скрипт полного восстановления хостовой среды One UI, памяти, прав и интерфейса |
+| `assets/backup_host.sh` | Скрипт создания снапшота рабочего стола, виджетов и шторки QS |
+| `assets/switch_to_lineage.sh` | Главный оркестратор переключения с One UI на GSI-контейнер |
+| `assets/return_to_oneui.sh` | Скрипт возврата экрана и сервисов в стоковую One UI |
+| `assets/master_prepare.sh` | Подготовка точек монтирования rootfs, APEX-модулей и изолированных данных |
+| `assets/master_inner.sh` | Выполняется внутри `unshare -m` и `pivot_root`, запускает Zygote |
+| `src/native/zygote_exec.c` | Нативный супервайзер гостевого Zygote |
+| `src/native/watchdog_feeder.c` | Аппаратный фидер сторожевого таймера ядра Linux |
+| `build_apk.sh` | Автономный скрипт компиляции и подписи APK без Android Studio |
+| `AnyGSI.apk` | Готовый собранный исполняемый установочный пакет |
 
-## Patches
+---
 
-### Patched system files (bind-mounted over the GSI)
-- `services_patched.jar` over `system/framework/services.jar`
-- `framework_patched.jar` over `system/framework/framework.jar`
-- `PermissionController_patched.apk`: removes the `android.permission.RANGING` reference so runtime-permission dialogs stop crashing (Samsung's PermissionController needs a permission the LineageOS 23.2 platform doesn't define)
-- Optional bind-mounts when present: `framework-res_patched.apk`, `libaudio_aidl_conversion_common_cpp_patched.so`, `libaudioclient_aidl_conversion_patched.so`
+## 🛠️ Требования
 
-### Boot and environment fixes
-1. **APEX paths in the container.** Host `/system/apex` and `/system_ext/apex` are bound into the rootfs after the GSI payloads are extracted, so PackageManagerService stops dying in `scanApexPackages`.
-2. **SELinux labels on the staged `/data`.** The tree is relabeled like a real `/data` (`system_data_file`, per-package `app_data_file`) instead of `shell_data_file`. Also `setenforce 0` during the takeover and `setenforce 1` on return.
-3. **Audio hang.** Host `audioserver`/`cameraserver` are left running (they used to be stopped/frozen, which deadlocked `AudioService`). Only the host zygote is suppressed.
-4. **Runaway `sf.log`.** SurfaceFlinger output goes to `/dev/null` (it was growing to hundreds of MB in minutes).
-5. **App data ownership.** `fix_app_dirs.sh` re-owns app data dirs to the uid PackageManager assigned, strips write bits from dex/apk/jar files (ART refuses writable dex), and creates missing dirs such as `/data/misc/bluedroid`.
-6. **No installd.** `ensure_app_storage.sh` plus a 15 s sweeper create `/data/user/0`, `/data/user_de/0` and shared-storage dirs for new installs, so apps installed inside Lineage can launch.
-7. **Gesture navigation.** Overlay idmaps are generated with `idmap2 --ignore-overlayable` before zygote starts.
-8. **Bluetooth crash loop** fixed by creating `/data/misc/bluedroid` before boot.
-9. **adb.** `Settings.Global.ADB_ENABLED` is pre-seeded, host `adb_keys` are copied into the guest, and `adb_watchdog.sh` keeps adbd and the USB gadget alive.
-10. **Networking.** The preferred APN is switched to `IPV4V6`, and `net_fix.sh` maintains a private routing table (4242) because the guest's ConnectivityService can't program the host's netd.
-11. **SMS.** `ims_watchdog.sh` keeps One UI's `imsd` running and `switch_to_lineage.sh` waits for voice registration before pivoting.
-12. **Boot diagnostics.** Each boot writes `/data/boot_failures.log`.
+1. Устройство с архитектурой **ARM64** с root-доступом (**KernelSU** рекомендуется, либо Magisk).
+2. Достаточно свободного места на разделе `/data` (от 4 до 10 ГБ в зависимости от размера GSI-образа).
+3. Образ GSI в формате `.img` (ARM64, AB / Read-Only или Read-Write).
 
-## Known issues
-- Returning to One UI may still need a manual reboot.
-- The guest binds the host's `media.codec`, whose AIDL hash differs from the GSI's, which can cause high CPU during codec enumeration.
-- No IMS stack in the guest, so **voice calls don't work** (data and SMS depend on One UI's `imsd`).
-- Developer options crash (the guest registers no `adb` service).
-- DTMF tones glitch, and deep-buffer audio hangs, so it stays disabled.
-- Never kill the host `netd` while Lineage is running.
+---
 
-## Building
-Edit the paths at the top of `build_apk.sh` (JDK 17, Android SDK build-tools 34, android-34 platform), provide your own signing keystore, then run `./build_apk.sh`.
+## 🔨 Сборка APK
 
-## Credits
-LineageOS GSI builds by MisterZtr (SourceForge). LineageOS and Android are trademarks of their respective owners. Not affiliated with Samsung, Google or LineageOS.
+Для сборки проекта не требуется Android Studio — достаточно установленного Android SDK и JDK:
+
+```bash
+chmod +x build_apk.sh
+./build_apk.sh
+```
+
+Готовый файл сохраняется в корне проекта: `AnyGSI.apk`.
+
+---
+
+## ⚠️ Известные ограничения текущей версии
+
+- Проект находится в стадии **активного прототипирования (Alpha)**.
+- Голосовые вызовы через IMS в гостевой системе требуют дополнительной настройки RIL.
+- В гостевом GSI некоторые функции разработчика могут перезапускать USB-стек (контролируется `adb_watchdog.sh`).
+- В случае сбоя используйте встроенную кнопку **«Restore One UI (Storage, Home & QS)»** или выполните в root-терминале:
+  ```sh
+  /system/bin/sh /data/lineage/restore_host.sh
+  ```
+
+---
+
+## 📄 Лицензия и благодарности
+
+Разработано для сообщества открытого Android-моддинга.
+Используются наработки сообщества GSI (MisterZtr, Phh/treble_experimentations).
+Android и One UI являются зарегистрированными товарными знаками соответствующих правообладателей.

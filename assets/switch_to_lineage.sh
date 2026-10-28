@@ -1,6 +1,7 @@
 #!/system/bin/sh
 # OneLineage Userspace Takeover Orchestrator
-STAGE="/data/local/tmp/lineage_stage"
+STAGE="/data/lineage"
+[ -d "$STAGE" ] || STAGE="/data/local/tmp/lineage_stage"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 RP=$(which resetprop 2>/dev/null || echo "/data/adb/ksu/bin/resetprop")
@@ -18,7 +19,8 @@ set_prop() {
     fi
 }
 
-BACKUP_DIR="/data/local/tmp/lineage_backups"
+BACKUP_DIR="/data/lineage/host_backup"
+[ -d "$BACKUP_DIR" ] || mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 
 echo "=== LINEAGEOS 23.2 TAKEOVER STARTING ==="
 
@@ -104,7 +106,7 @@ while true; do
                 echo "$(date) gadget lost adb, toggling (state: $usb, config: $cfg)" >> "$LOG"
                 setprop sys.usb.config none 2>/dev/null
                 sleep 1
-                setprop sys.usb.config rndis,adb 2>/dev/null
+                setprop sys.usb.config adb 2>/dev/null
                 sleep 2
                 setprop ctl.start adbd 2>/dev/null
             fi
@@ -151,13 +153,28 @@ fi
 set_prop ro.control_privapp_permissions log
 
 # --- ONEUI PROTECTION & RESCUEPARTY DISABLE ---
-echo "=== [1/6] Protecting OneUI Home Screen and Disabling RescueParty ==="
+echo "=== [1/6] Protecting OneUI Home Screen, Quick Settings and Disabling RescueParty ==="
 set_prop persist.sys.disable_rescue true
 set_prop sys.rescue_boot_count 0
 mkdir -p "$BACKUP_DIR"
-if [ -d "/data/user/0/com.sec.android.app.launcher/databases" ]; then
-    cp -a /data/user/0/com.sec.android.app.launcher/databases/* "$BACKUP_DIR/" 2>/dev/null || true
-    echo "One UI Home databases snapshotted to $BACKUP_DIR"
+APP_FILES="/data/user/0/com.wewaffles.anygsi/files"
+[ -d "$APP_FILES" ] || APP_FILES="/data/user/0/com.wewaffles.onelineage/files"
+if [ -f "$STAGE/backup_host.sh" ]; then
+    /system/bin/sh "$STAGE/backup_host.sh" 2>/dev/null || true
+elif [ -f "$APP_FILES/backup_host.sh" ]; then
+    /system/bin/sh "$APP_FILES/backup_host.sh" 2>/dev/null || true
+else
+    if [ -d "/data/user/0/com.sec.android.app.launcher/databases" ]; then
+        mkdir -p "$BACKUP_DIR/databases"
+        cp -a /data/user/0/com.sec.android.app.launcher/databases/* "$BACKUP_DIR/databases/" 2>/dev/null || true
+    fi
+    if [ -d "/data/user/0/com.sec.android.app.launcher/shared_prefs" ]; then
+        mkdir -p "$BACKUP_DIR/shared_prefs"
+        cp -a /data/user/0/com.sec.android.app.launcher/shared_prefs/* "$BACKUP_DIR/shared_prefs/" 2>/dev/null || true
+    fi
+    [ -f /data/system/users/0/appwidgets.xml ] && cp -f /data/system/users/0/appwidgets.xml "$BACKUP_DIR/appwidgets.xml" 2>/dev/null || true
+    QS_TILES=$(settings get secure sysui_qs_tiles 2>/dev/null)
+    [ -n "$QS_TILES" ] && echo "$QS_TILES" > "$BACKUP_DIR/sysui_qs_tiles.txt"
 fi
 
 # --- AUDIO LOW LATENCY TUNING ---
@@ -187,7 +204,8 @@ fi
 
 # Ensure all scripts and engine binaries exist in $STAGE
 mkdir -p "$STAGE/data"
-APP_FILES="/data/user/0/com.wewaffles.onelineage/files"
+APP_FILES="/data/user/0/com.wewaffles.anygsi/files"
+[ -d "$APP_FILES" ] || APP_FILES="/data/user/0/com.wewaffles.onelineage/files"
 if [ -d "$APP_FILES" ]; then
     cp -f "$APP_FILES"/* "$STAGE/" 2>/dev/null || true
 fi
@@ -223,6 +241,25 @@ kill -9 $(pidof zygote64) 2>/dev/null || true
 kill -9 $(pidof system_server) 2>/dev/null || true
 sleep 1
 
+# --- KERNEL SOFTDOG WATCHDOG FEEDER ----------------------------------------
+# Host system_server was holding FD to /dev/watchdog (major 10, minor 130).
+# Now that it was killed, nobody pets /dev/watchdog, which causes Samsung's softdog
+# kernel module to trigger 'Kernel panic - not syncing: Software Watchdog Timer expired 100s'.
+# Start watchdog_feeder immediately to pet /dev/watchdog every 5s and keep kernel alive!
+pkill -9 watchdog_feeder 2>/dev/null || true
+if [ -f "$STAGE/watchdog_feeder" ]; then
+    cp -f "$STAGE/watchdog_feeder" /data/local/tmp/watchdog_feeder
+    chmod 755 /data/local/tmp/watchdog_feeder
+    nohup /data/local/tmp/watchdog_feeder </dev/null >/data/local/tmp/watchdog_feeder.log 2>&1 &
+    echo "Started /data/local/tmp/watchdog_feeder (PID $!)"
+fi
+
+# --- GSI BOOT LOGCAT RECORDER ----------------------------------------------
+pkill -f "logcat.*gsi_boot_logcat.log" 2>/dev/null || true
+rm -f "$STAGE/data/gsi_boot_logcat.log" 2>/dev/null || true
+nohup logcat -b main,system,crash -v threadtime -r 2048 -n 2 -f "$STAGE/data/gsi_boot_logcat.log" </dev/null >/dev/null 2>&1 &
+echo "Started background logcat -> $STAGE/data/gsi_boot_logcat.log"
+
 # Stop the HOST media codec stack. The guest's libmedia binds `media.codec` from
 # the shared servicemanager, i.e. Samsung's mediaserver - whose IMediaCodecList
 # AIDL hash differs from the GSI's. The reply parcel is then parsed as garbage
@@ -241,10 +278,10 @@ sleep 1
 # would die too. Keep only the codec processes down, which is what causes the
 # spin described above.
 setprop ctl.start media 2>/dev/null || true
-for svc in media.codec media.metrics; do
+for svc in media.codec media.swcodec mediametrics mediaextractor samsung-software-media-c2-hal-1-0 vendor-qti-media-c2-hal-1-0; do
     setprop ctl.stop $svc 2>/dev/null || true
 done
-kill -9 $(pidof media.codec) $(pidof media.metrics) 2>/dev/null || true
+kill -9 $(pidof mediaswcodec) $(pidof mediametrics) $(pidof mediaextractor) 2>/dev/null || true
 
 # Same handover for wifi. The guest's WifiService binds IWificond (service
 # "wifinl80211") and drives the vendor HAL through it. Samsung's wificond is
@@ -279,7 +316,17 @@ while true; do
     sleep 2
     PID=\$(pidof system_server | awk '{print \$1}')
     if [ -n \"\$PID\" ]; then
-        if $BB nsenter -t \$PID -m /system/bin/dumpsys window 2>/dev/null | grep -q 'mStatusBar'; then
+        READY=0
+        if [ \"\$(\$BB nsenter -t \$PID -m /system/bin/getprop sys.boot_completed 2>/dev/null | tr -d '\\r')\" = \"1\" ]; then
+            READY=1
+        elif [ \"\$(\$BB nsenter -t \$PID -m /system/bin/service check activity 2>/dev/null | grep -c 'found')\" -ge 1 ] && \\
+             [ \"\$(\$BB nsenter -t \$PID -m /system/bin/service check window 2>/dev/null | grep -c 'found')\" -ge 1 ] && \\
+             [ \"\$(\$BB nsenter -t \$PID -m /system/bin/service check settings 2>/dev/null | grep -c 'found')\" -ge 1 ]; then
+            if ! \$BB nsenter -t \$PID -m /system/bin/dumpsys activity top 2>&1 | grep -qi 'Too early'; then
+                READY=1
+            fi
+        fi
+        if [ \"\$READY\" = \"1\" ]; then
             echo '[UI Activator] WindowManager is ready! Dismissing bootanim and unlocking...'
             setprop service.bootanim.exit 1
             kill -9 \$(pidof bootanimation) 2>/dev/null
@@ -290,14 +337,22 @@ while true; do
             $BB nsenter -t \$PID -m /system/bin/settings put system haptic_feedback_enabled 1
             $BB nsenter -t \$PID -m /system/bin/settings put system peak_refresh_rate 120.0
             $BB nsenter -t \$PID -m /system/bin/settings put system min_refresh_rate 120.0
+            # Display density fix for Galaxy S25 Ultra (Physical size: 720x1560, physical density: 300)
+            $BB nsenter -t \$PID -m /system/bin/wm density 300 2>/dev/null || true
+            # Complete device provisioning and user setup so Launcher and Settings never block
+            $BB nsenter -t \$PID -m /system/bin/settings put global device_provisioned 1 2>/dev/null || true
+            $BB nsenter -t \$PID -m /system/bin/settings put secure user_setup_complete 1 2>/dev/null || true
             # Gesture navigation. The GSI boots with the three-button overlay, and
             # this line used to force it back on every takeover.
             $BB nsenter -t \$PID -m /system/bin/cmd overlay enable-exclusive --category com.android.internal.systemui.navbar.gestural 2>/dev/null || true
             $BB nsenter -t \$PID -m /system/bin/settings put secure navigation_mode 2 2>/dev/null || true
             $BB nsenter -t \$PID -m /system/bin/pm disable android.ext.services/android.ext.services.notification.Assistant 2>/dev/null || true
+            $BB nsenter -t \$PID -m /system/bin/pm disable com.android.dialer/.app.voicemail.LegacyVoicemailNotificationReceiver 2>/dev/null || true
+            $BB nsenter -t \$PID -m /system/bin/setprop sys.user.0.ce_available true 2>/dev/null || true
             $BB nsenter -t \$PID -m /system/bin/input keyevent 224
             $BB nsenter -t \$PID -m /system/bin/input keyevent 82
-            $BB nsenter -t \$PID -m /system/bin/am unlock-user 0
+            $BB nsenter -t \$PID -m /system/bin/wm dismiss-keyguard 2>/dev/null || true
+            $BB nsenter -t \$PID -m /system/bin/am unlock-user 0 2>/dev/null || true
             $BB nsenter -t \$PID -m /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.HOME
             echo '[UI Activator] Home activated!'
             echo '[UI Activator] Creating missing app data dirs...'
@@ -331,6 +386,16 @@ while true; do
 
             # Mount emulated primary storage
             $BB nsenter -t \$PID -m /system/bin/sm mount \"emulated;0\" 2>/dev/null || true
+
+            echo '[UI Activator] Setup complete! Entering command listener loop...'
+            while true; do
+                if [ -f /data/local/tmp/container_cmd.sh ]; then
+                    CUR_PID=\$(pidof system_server | awk '{print \$1}')
+                    [ -n \"\$CUR_PID\" ] && \$BB nsenter -t \$CUR_PID -m /system/bin/sh /data/local/tmp/container_cmd.sh > /data/local/tmp/container_cmd.log 2>&1
+                    rm -f /data/local/tmp/container_cmd.sh
+                fi
+                sleep 2
+            done
             break
         fi
     fi
